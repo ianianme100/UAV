@@ -1,0 +1,179 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <MPU6050_light.h>
+
+// === 1. 硬體腳位定義 ===
+const int M1_PIN = 38; // 左前 (FL)
+const int M2_PIN = 41; // 右前 (FR)
+const int M3_PIN = 39; // 左後 (RL) 
+const int M4_PIN = 40; // 右後 (RR)
+const int I2C_SDA = 8;
+const int I2C_SCL = 9;
+
+// === 2. PWM 參數 (已優化為 Fast PWM) ===
+const int ESC_FREQ = 400; // 【修改】：針對 XXD 電變提升至 400Hz
+const int ESC_RES = 14;   // ESP32 14-bit 解析度 (0~16384)
+const int PWM_MIN = 900;
+const int PWM_MAX = 2000;
+
+// === 3. 系統狀態與全域變數 ===
+bool armed = false;
+unsigned long t_last;
+float baseThrottle = 1150.0f; // 基礎油門 (請確保此數值能讓馬達平順怠速)
+
+// 低通濾波器係數
+const float GYRO_LPF_ALPHA = 0.7f; 
+float gyroX_lpf = 0, gyroY_lpf = 0, gyroZ_lpf = 0;
+
+MPU6050 mpu(Wire);
+
+// === 4. PID 結構體 ===
+struct PID {
+    float Kp, Ki, Kd;
+    float integ = 0, prevErr = 0;
+    float outMin, outMax;
+    
+    float update(float sp, float val, float dt) {
+        float e = sp - val;
+        integ += e * dt;
+        if(integ > outMax) integ = outMax; 
+        if(integ < outMin) integ = outMin;
+        
+        float deriv = (dt > 0) ? (e - prevErr) / dt : 0;
+        prevErr = e;
+        
+        float out = Kp * e + Ki * integ + Kd * deriv;
+        if(out > outMax) out = outMax; 
+        if(out < outMin) out = outMin;
+        return out;
+    }
+    
+    void reset() { integ = 0; prevErr = 0; }
+};
+
+// === 5. 實例化 PID 控制器 (F450 專用保守參數) ===
+// 外環 (Angle)：負責角度回正，Kp 不要太大
+PID angPID_roll  {1.5f, 0.0f, 0.0f,  0, 0, -100.0f, +100.0f};
+PID angPID_pitch {1.5f, 0.0f, 0.0f,  0, 0, -100.0f, +100.0f};
+
+// 內環 (Rate)：負責抵抗外力。針對 XXD 電變，Kd 設為 0 以避免雜訊導致的高頻抽搐
+PID ratePID_roll  {0.15f, 0.01f, 0.0f, 0, 0, -200.0f, +200.0f};
+PID ratePID_pitch {0.15f, 0.01f, 0.0f, 0, 0, -200.0f, +200.0f};
+PID ratePID_yaw   {0.50f, 0.00f, 0.0f, 0, 0, -150.0f, +150.0f};
+
+// === 工具函式 (已修復：動態計算 PWM 週期) ===
+int usToTicks(int us) { 
+    // 通用轉換公式：Ticks = us * ( 2^解析度 / 週期us )
+    float period_us = 1000000.0f / ESC_FREQ; 
+    float ticks = us * (16384.0f / period_us); // 14-bit max is 16384
+    return (int)ticks; 
+}
+
+void writeMotor(int pin, float us_float) {
+    int us = constrain((int)us_float, PWM_MIN, PWM_MAX);
+    ledcWrite(pin, usToTicks(us));
+}
+
+void allESC(float us) {
+    writeMotor(M1_PIN, us); writeMotor(M2_PIN, us);
+    writeMotor(M3_PIN, us); writeMotor(M4_PIN, us);
+}
+
+// === 初始化 ===
+void setup() {
+    Serial.begin(115200);
+    Wire.begin(I2C_SDA, I2C_SCL);
+
+    ledcAttach(M1_PIN, ESC_FREQ, ESC_RES);
+    ledcAttach(M2_PIN, ESC_FREQ, ESC_RES);
+    ledcAttach(M3_PIN, ESC_FREQ, ESC_RES);
+    ledcAttach(M4_PIN, ESC_FREQ, ESC_RES);
+    allESC(PWM_MIN);
+
+    Serial.println("初始化 MPU6050 中...");
+    if (mpu.begin() != 0) {
+        Serial.println("MPU6050 連線失敗！系統死鎖！");
+        while (1);
+    }
+    
+    Serial.println("靜置 3 秒，進行陀螺儀校準...");
+    delay(3000);
+    mpu.calcOffsets();
+    Serial.println("校準完成！輸入 START 解鎖，STOP 鎖定。");
+    
+    t_last = micros();
+}
+
+// === 主迴圈 ===
+void loop() {
+    // --- 指令監聽 (注意：這是 Blocking 函式，正式飛行前建議改寫為非阻塞) ---
+    if (Serial.available()) {
+        String s = Serial.readStringUntil('\n'); s.trim();
+        if (s.equalsIgnoreCase("START")) {
+            armed = true;
+            angPID_roll.reset(); angPID_pitch.reset();
+            ratePID_roll.reset(); ratePID_pitch.reset(); ratePID_yaw.reset();
+            Serial.println("【系統啟動 START】");
+        } else if (s.equalsIgnoreCase("STOP")) {
+            armed = false;
+            allESC(PWM_MIN);
+            Serial.println("【安全鎖定 STOP】");
+        }
+    }
+
+    // --- 計算精確的時間差 (dt) ---
+    unsigned long now = micros();
+    float dt = (now - t_last) / 1000000.0f;
+    if (dt <= 0.001f) return;
+    t_last = now;
+
+    mpu.update();
+
+    // --- 讀取感測器並進行低通濾波 (LPF) ---
+    float roll_deg  = mpu.getAngleX();
+    float pitch_deg = mpu.getAngleY();
+    
+    float gyroX_raw = mpu.getGyroX();
+    float gyroY_raw = mpu.getGyroY();
+    float gyroZ_raw = mpu.getGyroZ();
+    
+    gyroX_lpf = GYRO_LPF_ALPHA * gyroX_lpf + (1.0f - GYRO_LPF_ALPHA) * gyroX_raw;
+    gyroY_lpf = GYRO_LPF_ALPHA * gyroY_lpf + (1.0f - GYRO_LPF_ALPHA) * gyroY_raw;
+    gyroZ_lpf = GYRO_LPF_ALPHA * gyroZ_lpf + (1.0f - GYRO_LPF_ALPHA) * gyroZ_raw;
+
+    // 未解鎖就不執行後續馬達輸出
+    if (!armed) return;
+
+    // ================= Control =================
+    float targetRoll_deg  = 0.0f;
+    float targetPitch_deg = 0.0f;
+    float targetYawRate   = 0.0f; 
+
+    // 2. 外環 (Angle Loop)
+    float rollRate_sp  = angPID_roll.update(targetRoll_deg,  roll_deg,  dt);
+    float pitchRate_sp = angPID_pitch.update(targetPitch_deg, pitch_deg, dt);
+
+    // 3. 內環 (Rate Loop)
+    float rollCorr  = ratePID_roll.update(rollRate_sp,  gyroX_lpf, dt);
+    float pitchCorr = ratePID_pitch.update(pitchRate_sp, gyroY_lpf, dt);
+    float yawCorr   = ratePID_yaw.update(targetYawRate, gyroZ_lpf, dt);
+
+    // 4. 馬達混控 (Mixer) - X 型配置
+    float m1 = baseThrottle - pitchCorr + rollCorr + yawCorr; // FL
+    float m2 = baseThrottle - pitchCorr - rollCorr - yawCorr; // FR
+    float m3 = baseThrottle + pitchCorr + rollCorr - yawCorr; // RL
+    float m4 = baseThrottle + pitchCorr - rollCorr + yawCorr; // RR
+
+    // 5. 輸出至 ESC
+    writeMotor(M1_PIN, m1);
+    writeMotor(M2_PIN, m2);
+    writeMotor(M3_PIN, m3);
+    writeMotor(M4_PIN, m4);
+
+    // 6. 監控儀表板
+    static uint32_t printCount = 0;
+    if (++printCount % 50 == 0) {
+        Serial.printf("Pch:%.1f Rol:%.1f | M1:%.0f M2:%.0f M3:%.0f M4:%.0f\n",
+                      pitch_deg, roll_deg, m1, m2, m3, m4);
+    }
+}
